@@ -75,9 +75,33 @@ function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt
 function toast(s){const t=$('#toast');t.textContent=s;t.classList.remove('hidden');setTimeout(()=>t.classList.add('hidden'),2600)}
 function nice(s){return s.charAt(0).toUpperCase()+s.slice(1)}
 function norm(s){return s.trim().toLowerCase().replace(/\s+/g,' ')}
-function phoneticFromApi(data){for(const d of data||[]){if(d.phonetic)return d.phonetic;for(const p of d.phonetics||[])if(p.text)return p.text}return '暂未获取到音标'}
-function audioFromApi(data){for(const d of data||[])for(const p of d.phonetics||[])if(p.audio)return p.audio;return ''}
-function defsFromApi(data){let arr=[];for(const d of data||[])for(const m of d.meanings||[])for(const x of m.definitions||[])arr.push({pos:m.partOfSpeech,definition:x.definition,example:x.example||''});return arr}
+function phoneticFromApi(data){
+  if(Array.isArray(data)){
+    for(const d of data){if(d.phonetic)return d.phonetic;for(const p of d.phonetics||[])if(p.text)return p.text}
+  }else{
+    for(const entry of (data?.entries||[]))for(const p of entry.pronunciations||[])if(p.text)return p.text;
+  }
+  return '暂未获取到音标';
+}
+function audioFromApi(data){
+  if(Array.isArray(data)){for(const d of data)for(const p of d.phonetics||[])if(p.audio)return p.audio}
+  else {for(const entry of (data?.entries||[]))for(const p of entry.pronunciations||[])if(p.audio)return p.audio}
+  return '';
+}
+function defsFromApi(data){
+  let arr=[];
+  if(Array.isArray(data)){
+    for(const d of data)for(const m of d.meanings||[])for(const x of m.definitions||[])arr.push({pos:m.partOfSpeech,definition:x.definition,example:x.example||''});
+  }else{
+    for(const entry of (data?.entries||[])){
+      for(const sense of entry.senses||[]){
+        if(sense.definition)arr.push({pos:entry.partOfSpeech||'',definition:sense.definition,example:(sense.examples||[])[0]||''});
+        for(const sub of sense.subsenses||[])if(sub.definition)arr.push({pos:entry.partOfSpeech||'',definition:sub.definition,example:(sub.examples||[])[0]||''});
+      }
+    }
+  }
+  return arr;
+}
 function rootHint(w){
  const map=[
  [/^substantial$/i,'substance（物质、实质）→ substantial（有实质内容的、相当大的）。把“实质/分量”与“大量、重要”联系起来。'],
@@ -113,19 +137,47 @@ function saveRecord(w,data){
  words[w]={...old,word:w,phonetic:phoneticFromApi(data),audio:audioFromApi(data),definitions:defs.length?defs:(old.definitions||[]),createdAt:old.createdAt||now,lastSearched:now,searchCount:(old.searchCount||0)+1,favorite:old.favorite||false,status:old.status||'learning',notes:old.notes||'',reviewStage:old.reviewStage||0,nextReview:old.nextReview||today(),lastReviewed:old.lastReviewed||null};
  persist();return words[w];
 }
+async function fetchWithTimeout(url,ms=9000){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),ms);
+  try{
+    const response=await fetch(url,{signal:controller.signal,cache:'no-store'});
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    return await response.json();
+  }finally{clearTimeout(timer)}
+}
 async function lookup(w){
- const btn=$('#searchBtn');btn.disabled=true;btn.textContent='查询中…';
- try{
-  let data=[];
-  const response=await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/'+encodeURIComponent(w));
-  if(response.ok)data=await response.json();
-  const record=saveRecord(w,data);currentWord=record;currentTab='meaning';renderWord(record);
-  $('#wordInput').value='';toast(data.length?'已查询并保存到本地词库':'已保存单词；基础释义未能自动获取，可检查拼写或联网状态。');
- }catch(e){
-  const existing=words[w];
-  if(existing){currentWord=existing;renderWord(existing);toast('联网词典暂不可用，已打开本地记录。')}
-  else {const record=saveRecord(w,[]);currentWord=record;renderWord(record);toast('网络查询失败，已保存单词记录；请联网后重新查询释义。')}
- }finally{btn.disabled=false;btn.textContent='开始学习　↗'}
+  const btn=$('#searchBtn');btn.disabled=true;btn.textContent='查询中…';
+  const sources=[
+    {name:'Free Dictionary API',url:'https://api.dictionaryapi.dev/api/v2/entries/en/'+encodeURIComponent(w)},
+    {name:'FreeDictionaryAPI',url:'https://freedictionaryapi.com/api/v1/entries/en/'+encodeURIComponent(w)+'?translations=true'}
+  ];
+  let successfulData=null;
+  try{
+    for(const source of sources){
+      try{
+        const data=await fetchWithTimeout(source.url,9000);
+        if(defsFromApi(data).length){successfulData=data;break}
+      }catch(err){/* 自动尝试备用数据源 */}
+    }
+    if(successfulData){
+      const record=saveRecord(w,successfulData);
+      currentWord=record;currentTab='meaning';renderWord(record);
+      $('#wordInput').value='';
+      toast('查询成功，已保存到本地词库');
+    }else{
+      const existing=words[w];
+      if(existing && (existing.definitions||[]).length){
+        currentWord=existing;currentTab='meaning';renderWord(existing);
+        toast('在线词典暂不可用，已打开本地已有释义');
+      }else{
+        const record=existing||{word:w,phonetic:'暂未获取到音标',audio:'',definitions:[],createdAt:new Date().toISOString(),searchCount:0,favorite:false,status:'learning',notes:'',reviewStage:0,nextReview:today(),lastReviewed:null};
+        currentWord=record;currentTab='meaning';renderWord(record);
+        $('#tabContent').insertAdjacentHTML('afterbegin','<div class="callout warning"><b>暂时无法获取词典数据。</b><br>已尝试两个免费词典数据源，但均未返回释义。请稍后重试，或检查当前网络。此次失败不会计为成功查询，也不会覆盖已有释义。</div>');
+        toast('两个免费词典暂时都无法连接，请稍后重试');
+      }
+    }
+  }finally{btn.disabled=false;btn.textContent='开始学习　↗'}
 }
 function renderWord(r){
  const defs=r.definitions||[], main=defs[0]||{pos:'',definition:'暂无词典释义。请检查拼写或稍后重试。'};
